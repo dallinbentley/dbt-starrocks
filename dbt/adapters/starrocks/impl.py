@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from concurrent.futures import Future
-from typing import Callable, Dict, List, Optional, Set, FrozenSet, Tuple
+from typing import Callable, Dict, List, Optional, Set, FrozenSet, Tuple, Any
 
 import agate
 import dbt.exceptions
@@ -43,6 +43,7 @@ class StarRocksConfig(AdapterConfig):
     distributed_by: Optional[List[str]] = None
     buckets: Optional[int] = None
     properties: Optional[Dict[str, str]] = None
+    materialized: Optional[str] = None  # table/view/materialized_view
 
 
 class StarRocksAdapter(SQLAdapter):
@@ -103,6 +104,100 @@ class StarRocksAdapter(SQLAdapter):
             relations.append(relation)
 
         return relations
+
+    def drop_relation(self, relation: StarRocksRelation) -> None:
+        """Drop the given relation and its dependencies (like views)."""
+        if relation.type == RelationType.View:
+            sql = "DROP VIEW IF EXISTS {relation}"
+        else:
+            sql = "DROP TABLE IF EXISTS {relation}"
+        self.execute_macro(
+            'drop_relation',
+            kwargs={'relation': relation, 'sql': sql}
+        )
+
+    def truncate_relation(self, relation: StarRocksRelation) -> None:
+        """Truncate the given relation."""
+        sql = "TRUNCATE TABLE {relation}"
+        self.execute_macro(
+            'truncate_relation',
+            kwargs={'relation': relation, 'sql': sql}
+        )
+
+    def rename_relation(
+        self, from_relation: StarRocksRelation, to_relation: StarRocksRelation
+    ) -> None:
+        """Rename the relation from one name to another."""
+        self.execute_macro(
+            'rename_relation',
+            kwargs={
+                'from_relation': from_relation,
+                'to_relation': to_relation
+            }
+        )
+
+    def materialize_as_table(
+        self, dataset: agate.Table, table: StarRocksRelation
+    ) -> None:
+        """Convert the given dataset into a table."""
+        if len(dataset.rows) == 0:
+            return
+
+        column_names = dataset.column_names
+        quoted_columns = [self.quote(col) for col in column_names]
+        column_list = ", ".join(quoted_columns)
+        value_list = []
+        
+        for row in dataset.rows:
+            values = []
+            for value in row:
+                if value is None:
+                    values.append('NULL')
+                elif isinstance(value, str):
+                    values.append("'{}'".format(value.replace("'", "''")))
+                else:
+                    values.append(str(value))
+            value_list.append("({})".format(", ".join(values)))
+
+        sql = """
+            INSERT INTO {table} ({columns})
+            VALUES {values}
+        """.format(
+            table=table,
+            columns=column_list,
+            values=",\n".join(value_list)
+        )
+        self.execute(sql)
+
+    def create_view_as(self, relation: StarRocksRelation, sql: str) -> None:
+        """Create a view."""
+        sql = f"CREATE VIEW {relation} AS {sql}"
+        self.execute(sql)
+
+    def create_materialized_view(
+        self, relation: StarRocksRelation, sql: str, config: Dict[str, Any]
+    ) -> None:
+        """Create a materialized view with the given properties."""
+        properties = []
+        
+        if config.get('refresh_type'):
+            properties.append(f"REFRESH {config['refresh_type']}")
+        
+        if config.get('partition_by'):
+            partition_cols = ", ".join(config['partition_by'])
+            properties.append(f"PARTITION BY ({partition_cols})")
+        
+        if config.get('distributed_by'):
+            dist_cols = ", ".join(config['distributed_by'])
+            properties.append(f"DISTRIBUTED BY HASH({dist_cols})")
+            
+        if config.get('buckets'):
+            properties.append(f"BUCKETS {config['buckets']}")
+            
+        properties_str = " ".join(properties)
+        
+        sql = f"CREATE MATERIALIZED VIEW {relation} {properties_str} AS {sql}"
+        self.execute(sql)
 
     def get_catalog(self, manifest, used_schemas):
         schema_map = self._get_catalog_schemas(manifest)

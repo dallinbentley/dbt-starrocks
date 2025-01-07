@@ -35,41 +35,31 @@ logger = AdapterLogger("starrocks")
 
 @dataclass
 class StarRocksCredentials(Credentials):
-    host: Optional[str] = None
-    port: Optional[int] = None
-    catalog: Optional[str] = 'default_catalog'
-    database: Optional[str] = None
-    schema: Optional[str] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    charset: Optional[str] = None
-    version: Optional[str] = None
-    use_pure: Optional[str] = None
+    # Required fields (no defaults)
+    host: str
+    username: str
+    password: str
+    database: str  # Required by dbt core
+    # Optional fields (with defaults)
+    port: int
+    catalog: str
+    charset: Optional[str]
+    schema: Optional[str]
+    version: Optional[str]
+    use_pure: bool
 
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+    @property
+    def unique_field(self) -> str:
+        """Return the field that uniquely identifies this connection."""
+        return self.host
 
     def __post_init__(self):
-        # starrocks classifies database and schema as the same thing
-        if (
-            self.database is not None and
-            self.database != self.schema
-        ):
-            raise dbt_common.exceptions.DbtRuntimeError(
-                f"    schema: {self.schema} \n"
-                f"    database: {self.database} \n"
-                f"On StarRocks, database must be omitted or have the same value as"
-                f" schema."
-            )
+        # Use database value as schema if schema not provided
+        self.schema = self.schema or self.database
 
     @property
     def type(self):
         return 'starrocks'
-
-    @property
-    def unique_field(self):
-        return self.schema
 
     def _connection_keys(self):
         """
@@ -78,10 +68,9 @@ class StarRocksCredentials(Credentials):
         return (
             "host",
             "port",
-            "schema",
             "catalog",
+            "schema",
             "username",
-            "use_pure",
         )
 
 
@@ -110,70 +99,57 @@ class StarRocksConnectionManager(SQLConnectionManager):
             return connection
 
         credentials = cls.get_credentials(connection.credentials)
-        kwargs = {"host": credentials.host, "username": credentials.username,
-                  "password": credentials.password, "database": credentials.catalog + "." + credentials.schema}
-
-        kwargs["buffered"] = True
-
-        if credentials.port:
-            kwargs["port"] = credentials.port
-
-        if credentials.use_pure in ["true", "True"]:
-            kwargs["use_pure"] = True
+        kwargs = {
+            "host": credentials.host,
+            "port": credentials.port,
+            "user": credentials.username,
+            "password": credentials.password,
+            "database": f"{credentials.catalog}.{credentials.schema}",
+            "charset": credentials.charset,
+            "use_pure": credentials.use_pure,
+            "buffered": True,
+            "connection_timeout": 60
+        }
 
         try:
             connection.handle = mysql.connector.connect(**kwargs)
             connection.state = 'open'
-        except mysql.connector.Error:
+            
+            # Add server_version handling
+            cursor = connection.handle.cursor()
+            cursor.execute("SELECT version()")
+            version_str = cursor.fetchone()[0]
+            cursor.close()
+            connection.handle.server_version = _parse_version(version_str)
+            
+        except mysql.connector.Error as e:
+            if e.errno == mysql.connector.errorcode.ER_BAD_DB_ERROR:
+                try:
+                    # Try connecting to information_schema to create the database
+                    kwargs["database"] = f"{credentials.catalog}.information_schema"
+                    temp_conn = mysql.connector.connect(**kwargs)
+                    cursor = temp_conn.cursor()
+                    
+                    # Create the database if it doesn't exist
+                    create_db_sql = f"CREATE DATABASE IF NOT EXISTS `{credentials.catalog}`.`{credentials.schema}`"
+                    cursor.execute(create_db_sql)
+                    cursor.close()
+                    temp_conn.close()
 
-            try:
-                logger.debug("Failed connection without supplying the `database`. "
-                             "Trying again with `database` included.")
-
-                # Try again with the database included
-                database_toBeCreated = kwargs["database"]
-                kwargs["database"] = "information_schema"
-
-                connection.handle = mysql.connector.connect(**kwargs)
-                connection.state = 'open'
-
-                mycursor = connection.handle.cursor()
-
-                mycursor.execute("CREATE DATABASE " + database_toBeCreated)
-                kwargs["database"] = database_toBeCreated
-
-                connection.handle = mysql.connector.connect(**kwargs)
-                connection.state = 'open'
-
-            except mysql.connector.Error as e:
-
-                logger.debug("Got an error when attempting to open a StarRocks "
-                             "connection: '{}'".format(e))
-
+                    # Reconnect with the new database
+                    kwargs["database"] = f"{credentials.catalog}.{credentials.schema}"
+                    connection.handle = mysql.connector.connect(**kwargs)
+                    connection.state = 'open'
+                except mysql.connector.Error as create_err:
+                    logger.debug(f"Failed to create database: {str(create_err)}")
+                    connection.handle = None
+                    connection.state = 'fail'
+                    raise dbt_common.exceptions.FailedToConnectError(str(create_err))
+            else:
+                logger.debug(f"Error connecting to StarRocks: {str(e)}")
                 connection.handle = None
                 connection.state = 'fail'
-
-                raise dbt_common.exceptions.ConnectionError(str(e))
-
-        if credentials.version is None:
-            cursor = connection.handle.cursor()
-            try:
-                cursor.execute("select current_version()")
-                connection.handle.server_version = _parse_version(
-                    cursor.fetchone()[0])
-            except Exception as e:
-                logger.debug(
-                    "Got an error when obtain StarRocks version exception: '{}'".format(e))
-        else:
-            version = credentials.version.strip().split('.')
-            if len(version) == 3:
-                connection.handle.server_version = (
-                    int(version[0]), int(version[1]), int(version[2]))
-            elif len(version) == 2:
-                connection.handle.server_version = (
-                    int(version[0]), int(version[1]), 0)
-            else:
-                logger.debug("Config version '{}' is invalid".format(version))
+                raise dbt_common.exceptions.FailedToConnectError(str(e))
 
         return connection
 
